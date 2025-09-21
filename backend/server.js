@@ -1,199 +1,158 @@
+// server.js
 import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
 import dotenv from "dotenv";
+import mongoose from "mongoose";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
+import passport from "passport";
+import session from "express-session";
+import { Strategy as GoogleStrategy } from "passport-google-oauth20";
 
 dotenv.config();
-
 const app = express();
-app.use(cors());
-app.use(express.json());
 
+// Middleware
+app.use(cors({ origin: true, credentials: true }));
+app.use(express.json());
+app.use(session({ secret: process.env.SESSION_SECRET, resave: false, saveUninitialized: true }));
+app.use(passport.initialize());
+app.use(passport.session());
+
+// MongoDB connection
+mongoose.connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true });
+
+// User schema
+const userSchema = new mongoose.Schema({
+  email: { type: String, unique: true },
+  password: String,
+  googleId: String,
+  remainingCredits: { type: Number, default: 5 } // free generations
+});
+const User = mongoose.model("User", userSchema);
+
+// JWT helper
+const generateToken = (user) => jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: "7d" });
+
+// Passport Google OAuth
+passport.use(new GoogleStrategy({
+  clientID: process.env.GOOGLE_CLIENT_ID,
+  clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+  callbackURL: "/auth/google/callback"
+}, async (accessToken, refreshToken, profile, done) => {
+  try {
+    const user = await User.findOne({ googleId: profile.id });
+    if (user) return done(null, user);
+    const newUser = await User.create({ googleId: profile.id, email: profile.emails[0].value });
+    return done(null, newUser);
+  } catch (err) {
+    return done(err, null);
+  }
+}));
+
+passport.serializeUser((user, done) => done(null, user._id));
+passport.deserializeUser(async (id, done) => {
+  const user = await User.findById(id);
+  done(null, user);
+});
+
+// JWT middleware
+const authMiddleware = async (req, res, next) => {
+  const token = req.headers.authorization?.split(" ")[1];
+  if (!token) return res.status(401).json({ error: "No token provided" });
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = await User.findById(decoded.id);
+    next();
+  } catch {
+    return res.status(401).json({ error: "Invalid token" });
+  }
+};
+
+// Gemini API config
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = "gemini-1.5-flash-8b-latest"; // Free / lightweight model
+const GEMINI_MODEL = "gemini-1.5-flash-8b-latest";
 const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
 
+// Routes
 
-app.post("/summarize", async (req, res) => {
+// Signup
+app.post("/signup", async (req, res) => {
   try {
+    const { email, password } = req.body;
+    const hashed = await bcrypt.hash(password, 10);
+    const user = await User.create({ email, password: hashed });
+    const token = generateToken(user);
+    res.json({ token, email: user.email, remainingCredits: user.remainingCredits });
+  } catch (err) {
+    res.status(400).json({ error: "Signup failed", message: err.message });
+  }
+});
+
+// Login
+app.post("/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const user = await User.findOne({ email });
+    if (!user) return res.status(400).json({ error: "Invalid credentials" });
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) return res.status(400).json({ error: "Invalid credentials" });
+    const token = generateToken(user);
+    res.json({ token, email: user.email, remainingCredits: user.remainingCredits });
+  } catch (err) {
+    res.status(400).json({ error: "Login failed", message: err.message });
+  }
+});
+
+// Google OAuth
+app.get("/auth/google", passport.authenticate("google", { scope: ["profile", "email"] }));
+app.get("/auth/google/callback", 
+  passport.authenticate("google", { failureRedirect: "/login" }),
+  (req, res) => {
+    const token = generateToken(req.user);
+    res.redirect(`${process.env.FRONTEND_URL}/?token=${token}`); // send JWT to frontend
+  }
+);
+
+// Summarize (protected)
+app.post("/summarize", authMiddleware, async (req, res) => {
+  try {
+    const user = req.user;
+    if (user.remainingCredits <= 0) return res.status(403).json({ error: "No remaining free generations" });
+
     const { text } = req.body;
+    if (!text || text.trim().length < 20) return res.status(400).json({ error: "Insufficient content" });
 
-    if (!text || text.trim().length < 20) {
-      return res.status(400).json({ 
-        error: "Insufficient content",
-        message: "Please provide content with at least 20 characters" 
-      });
-    }
-    if (!GEMINI_API_KEY) {
-      return res.status(500).json({ 
-        error: "Server configuration error",
-        message: "Gemini API key not configured" 
-      });
-    }
-
-    // Correct payload structure for Gemini API
     const payload = {
-      contents: [
-        {
-          parts: [
-            {
-              text: `Create a compelling, engaging social media post based on the following content. 
-              Include relevant hashtags and make it conversational and authentic:
-              
-              ${text.substring(0, 3000)}`
-            }
-          ]
-        }
-      ],
-      generationConfig: {
-        temperature: 0.9,
-        maxOutputTokens: 280,
-        topP: 0.95
-      }
+      contents: [{ parts: [{ text: `Create a social media post based on: ${text.substring(0, 3000)}` }] }],
+      generationConfig: { temperature: 0.9, maxOutputTokens: 280, topP: 0.95 }
     };
 
-    const response = await fetch(GEMINI_API_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(payload)
-    });
-
-    if (!response.ok) {
-      const errorData = await response.json();
-      console.error("Gemini API error:", errorData);
-      return res.status(response.status).json({
-        error: "Gemini API failed",
-        details: errorData
-      });
-    }
+    const response = await fetch(GEMINI_API_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    if (!response.ok) return res.status(response.status).json({ error: "Gemini API failed" });
 
     const result = await response.json();
-    
-    // Extract the generated text from the response
-    let generatedText = "";
-    if (result.candidates && result.candidates[0] && result.candidates[0].content) {
-      generatedText = result.candidates[0].content.parts[0].text.trim();
-    }
+    const generatedText = result?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+    if (!generatedText) return res.status(500).json({ error: "Empty Gemini response" });
 
-    if (generatedText && generatedText.length > 10) {
-      console.log("✅ Gemini success:", generatedText);
-      return res.json({ 
-        generated_text: generatedText, 
-        source: "gemini",
-        length: generatedText.length
-      });
-    } else {
-      throw new Error("Empty or invalid response from Gemini API");
-    }
+    user.remainingCredits -= 1;
+    await user.save();
 
-  } catch (error) {
-    console.error("❌ Error in /summarize:", error.message);
-    res.status(500).json({ 
-      error: "Internal server error",
-      message: error.message
-    });
+    res.json({ generated_text: generatedText, remainingCredits: user.remainingCredits });
+
+  } catch (err) {
+    res.status(500).json({ error: "Summarize failed", message: err.message });
   }
 });
 
+// Health check
 app.get("/health", (req, res) => {
-  res.json({ 
-    status: "✅ Server is running", 
-    timestamp: new Date().toISOString(),
-    gemini_configured: !!GEMINI_API_KEY,
-    model: GEMINI_MODEL
-  });
-});
-
-// Test endpoint to verify the API works
-app.post("/test", async (req, res) => {
-  try {
-    const testContent = "Mars is the fourth planet from the Sun. The surface of Mars is orange-red because it is covered in iron oxide dust, giving it the nickname 'the Red Planet'.";
-    
-    const payload = {
-      contents: [
-        {
-          parts: [
-            {
-              text: `Create a social media post about: ${testContent}`
-            }
-          ]
-        }
-      ],
-      generationConfig: {
-        temperature: 0.8,
-        maxOutputTokens: 150
-      }
-    };
-
-    const response = await fetch(GEMINI_API_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(payload)
-    });
-
-    if (!response.ok) {
-      const errorData = await response.json();
-      return res.status(500).json({
-        error: "Test failed",
-        details: errorData
-      });
-    }
-
-    const result = await response.json();
-    const generatedText = result.candidates[0].content.parts[0].text.trim();
-    
-    res.json({
-      test: "success",
-      generated_text: generatedText,
-      model: GEMINI_MODEL
-    });
-
-  } catch (error) {
-    res.status(500).json({
-      error: "Test failed",
-      message: error.message
-    });
-  }
-});
-
-// List available models (for debugging)
-app.get("/models", async (req, res) => {
-  if (!GEMINI_API_KEY) {
-    return res.status(500).json({ 
-      error: "API key not configured"
-    });
-  }
-  
-  try {
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}`);
-    
-    if (response.ok) {
-      const models = await response.json();
-      res.json({ 
-        models: models.models || []
-      });
-    } else {
-      res.status(500).json({ 
-        error: "Failed to fetch models",
-        status: response.status
-      });
-    }
-  } catch (error) {
-    res.status(500).json({ 
-      error: "Failed to fetch models",
-      message: error.message
-    });
-  }
+  res.json({ status: "Server running", geminiConfigured: !!GEMINI_API_KEY, model: GEMINI_MODEL });
 });
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-  console.log(`✅ Server running on http://localhost:${PORT}`);
-  console.log("🎯 Endpoints: POST /summarize, POST /test, GET /models");
-  console.log(`🔑 Gemini API: ${GEMINI_API_KEY ? "Configured" : "Not configured"}`);
-  console.log(`🤖 Model: ${GEMINI_MODEL}`);
+  console.log(`Server running on port ${PORT}`);
+  console.log("Endpoints: POST /signup, POST /login, GET /auth/google, POST /summarize, GET /health");
 });
