@@ -150,7 +150,17 @@ app.post("/summarize", authMiddleware, async (req, res) => {
 app.get("/health", (req, res) => {
   res.json({ status: "Server running", geminiConfigured: !!GEMINI_API_KEY, model: GEMINI_MODEL });
 });
-
+// Get user data (protected)
+app.get("/user", authMiddleware, async (req, res) => {
+  try {
+    res.json({ 
+      email: req.user.email, 
+      remainingCredits: req.user.remainingCredits 
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch user data" });
+  }
+});
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
