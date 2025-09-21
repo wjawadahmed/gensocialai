@@ -1,10 +1,9 @@
-// server.js
+// server.js - FIREBASE VERSION
 import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
 import dotenv from "dotenv";
-import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
+import admin from "firebase-admin";
 import sqlite3 from "sqlite3";
 import { open } from "sqlite";
 import path from "path";
@@ -17,11 +16,34 @@ const app = express();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Initialize Firebase Admin
+const serviceAccount = {
+  type: "service_account",
+  project_id: process.env.FIREBASE_PROJECT_ID,
+  private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
+  private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+  client_email: process.env.FIREBASE_CLIENT_EMAIL,
+  client_id: process.env.FIREBASE_CLIENT_ID,
+  auth_uri: "https://accounts.google.com/o/oauth2/auth",
+  token_uri: "https://oauth2.googleapis.com/token",
+  auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
+  client_x509_cert_url: process.env.FIREBASE_CLIENT_CERT_URL
+};
+
+try {
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount)
+  });
+  console.log("Firebase Admin initialized successfully");
+} catch (error) {
+  console.error("Firebase initialization error:", error);
+}
+
 // Middleware
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
 
-// SQLite Database setup
+// SQLite Database setup (for storing user credits)
 let db;
 async function initializeDatabase() {
   try {
@@ -30,13 +52,11 @@ async function initializeDatabase() {
       driver: sqlite3.Database
     });
 
-    // Create users table
+    // Create users table for credits
     await db.exec(`
-      CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+      CREATE TABLE IF NOT EXISTS user_credits (
+        uid TEXT PRIMARY KEY,
         email TEXT UNIQUE,
-        password TEXT,
-        googleId TEXT UNIQUE,
         remainingCredits INTEGER DEFAULT 5,
         createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
       )
@@ -51,86 +71,65 @@ async function initializeDatabase() {
 // Initialize database
 initializeDatabase();
 
-// Database helper functions
-const findUser = async (query) => {
+// Database helper functions for credits
+const getUserCredits = async (uid) => {
   try {
-    if (query.email) {
-      return await db.get('SELECT * FROM users WHERE email = ?', query.email);
-    } else if (query.googleId) {
-      return await db.get('SELECT * FROM users WHERE googleId = ?', query.googleId);
-    } else if (query.id) {
-      return await db.get('SELECT * FROM users WHERE id = ?', query.id);
-    }
+    return await db.get('SELECT * FROM user_credits WHERE uid = ?', uid);
   } catch (error) {
     console.error("Database query error:", error);
     return null;
   }
 };
 
-const createUser = async (userData) => {
+const createUserCredits = async (uid, email) => {
   try {
-    const { email, password, googleId, remainingCredits = 5 } = userData;
     const result = await db.run(
-      'INSERT INTO users (email, password, googleId, remainingCredits) VALUES (?, ?, ?, ?)',
-      [email, password, googleId, remainingCredits]
+      'INSERT INTO user_credits (uid, email, remainingCredits) VALUES (?, ?, ?)',
+      [uid, email, 5]
     );
     
-    return { 
-      id: result.lastID, 
-      email, 
-      password, 
-      googleId, 
-      remainingCredits 
-    };
+    return { uid, email, remainingCredits: 5 };
   } catch (error) {
     console.error("Database insert error:", error);
     throw error;
   }
 };
 
-const updateUser = async (id, updates) => {
+const updateUserCredits = async (uid, remainingCredits) => {
   try {
-    const fields = [];
-    const values = [];
-    
-    for (const [key, value] of Object.entries(updates)) {
-      fields.push(`${key} = ?`);
-      values.push(value);
-    }
-    
-    values.push(id);
-    
     await db.run(
-      `UPDATE users SET ${fields.join(', ')} WHERE id = ?`,
-      values
+      'UPDATE user_credits SET remainingCredits = ? WHERE uid = ?',
+      [remainingCredits, uid]
     );
     
-    return await findUser({ id });
+    return await getUserCredits(uid);
   } catch (error) {
     console.error("Database update error:", error);
     throw error;
   }
 };
 
-// JWT helper
-const generateToken = (user) => jwt.sign({ id: user.id }, process.env.JWT_SECRET || 'fallback-secret', { expiresIn: "7d" });
-
-// JWT middleware
-const authMiddleware = async (req, res, next) => {
-  const token = req.headers.authorization?.split(" ")[1];
-  if (!token) return res.status(401).json({ error: "No token provided" });
+// Firebase Auth middleware
+const firebaseAuthMiddleware = async (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: "No token provided" });
+  }
+  
+  const idToken = authHeader.split('Bearer ')[1];
   
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'fallback-secret');
-    const user = await findUser({ id: decoded.id });
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+    req.user = decodedToken;
     
-    if (!user) {
-      return res.status(401).json({ error: "User not found" });
-    }
+    // Get user credits from our database
+    const userCredits = await getUserCredits(decodedToken.uid);
+    req.user.remainingCredits = userCredits ? userCredits.remainingCredits : 5;
     
-    req.user = user;
     next();
-  } catch (jwtErr) {
+  } catch (error) {
+    console.error("Firebase auth error:", error);
     return res.status(401).json({ error: "Invalid token" });
   }
 };
@@ -142,107 +141,30 @@ const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/
 
 // Routes
 
-// Signup
-app.post("/signup", async (req, res) => {
+// Create custom token endpoint (for testing or special cases)
+app.post("/create-custom-token", async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { uid } = req.body;
     
-    if (!email || !password) {
-      return res.status(400).json({ error: "Email and password are required" });
+    if (!uid) {
+      return res.status(400).json({ error: "UID is required" });
     }
     
-    // Check if user exists
-    const existingUser = await findUser({ email });
-    if (existingUser) {
-      return res.status(400).json({ error: "User already exists" });
-    }
-    
-    const hashed = await bcrypt.hash(password, 10);
-    const user = await createUser({ email, password: hashed });
-    const token = generateToken(user);
-    
-    res.json({ 
-      token, 
-      email: user.email, 
-      remainingCredits: user.remainingCredits 
-    });
-  } catch (err) {
-    console.error("Signup error:", err);
-    res.status(400).json({ error: "Signup failed", message: err.message });
-  }
-});
-
-// Login
-app.post("/login", async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    
-    if (!email || !password) {
-      return res.status(400).json({ error: "Email and password are required" });
-    }
-    
-    const user = await findUser({ email });
-    
-    if (!user) return res.status(400).json({ error: "Invalid credentials" });
-    
-    // Check if user has password
-    if (!user.password) {
-      return res.status(400).json({ error: "Please use Google login" });
-    }
-    
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) return res.status(400).json({ error: "Invalid credentials" });
-    
-    const token = generateToken(user);
-    res.json({ 
-      token, 
-      email: user.email, 
-      remainingCredits: user.remainingCredits 
-    });
-  } catch (err) {
-    console.error("Login error:", err);
-    res.status(400).json({ error: "Login failed", message: err.message });
-  }
-});
-
-// Simple Google auth endpoint (for extension compatibility)
-app.post("/auth/google", async (req, res) => {
-  try {
-    const { email, googleId } = req.body;
-    
-    if (!email || !googleId) {
-      return res.status(400).json({ error: "Email and Google ID are required" });
-    }
-    
-    let user = await findUser({ email });
-    
-    if (!user) {
-      // Create new user
-      user = await createUser({ email, googleId });
-    } else if (!user.googleId) {
-      // Update existing user with Google ID
-      await updateUser(user.id, { googleId });
-      user.googleId = googleId;
-    }
-    
-    const token = generateToken(user);
-    res.json({ 
-      token, 
-      email: user.email, 
-      remainingCredits: user.remainingCredits 
-    });
-  } catch (err) {
-    console.error("Google auth error:", err);
-    res.status(400).json({ error: "Google authentication failed" });
+    const customToken = await admin.auth().createCustomToken(uid);
+    res.json({ customToken });
+  } catch (error) {
+    console.error("Create custom token error:", error);
+    res.status(500).json({ error: "Failed to create custom token" });
   }
 });
 
 // Get user data (protected)
-app.get("/user", authMiddleware, async (req, res) => {
+app.get("/user", firebaseAuthMiddleware, async (req, res) => {
   try {
     res.json({ 
       email: req.user.email, 
-      remainingCredits: req.user.remainingCredits 
+      remainingCredits: req.user.remainingCredits,
+      uid: req.user.uid
     });
   } catch (err) {
     console.error("User data error:", err);
@@ -250,8 +172,29 @@ app.get("/user", authMiddleware, async (req, res) => {
   }
 });
 
+// Initialize user credits (called after Firebase auth)
+app.post("/init-user", firebaseAuthMiddleware, async (req, res) => {
+  try {
+    const { uid, email } = req.user;
+    
+    let userCredits = await getUserCredits(uid);
+    
+    if (!userCredits) {
+      userCredits = await createUserCredits(uid, email);
+    }
+    
+    res.json({ 
+      email: userCredits.email, 
+      remainingCredits: userCredits.remainingCredits 
+    });
+  } catch (err) {
+    console.error("Init user error:", err);
+    res.status(500).json({ error: "Failed to initialize user" });
+  }
+});
+
 // Summarize (protected)
-app.post("/summarize", authMiddleware, async (req, res) => {
+app.post("/summarize", firebaseAuthMiddleware, async (req, res) => {
   try {
     const user = req.user;
     
@@ -276,11 +219,12 @@ app.post("/summarize", authMiddleware, async (req, res) => {
       const generatedText = mockResponses[Math.floor(Math.random() * mockResponses.length)];
       
       // Update user credits
-      await updateUser(user.id, { remainingCredits: user.remainingCredits - 1 });
+      const newCredits = user.remainingCredits - 1;
+      await updateUserCredits(user.uid, newCredits);
       
       return res.json({ 
         generated_text: generatedText, 
-        remainingCredits: user.remainingCredits - 1 
+        remainingCredits: newCredits 
       });
     }
 
@@ -316,11 +260,12 @@ app.post("/summarize", authMiddleware, async (req, res) => {
     }
 
     // Update user credits
-    await updateUser(user.id, { remainingCredits: user.remainingCredits - 1 });
+    const newCredits = user.remainingCredits - 1;
+    await updateUserCredits(user.uid, newCredits);
 
     res.json({ 
       generated_text: generatedText, 
-      remainingCredits: user.remainingCredits - 1 
+      remainingCredits: newCredits 
     });
 
   } catch (err) {
@@ -337,6 +282,7 @@ app.get("/health", async (req, res) => {
     res.json({ 
       status: "Server running", 
       database: "connected",
+      firebase: "initialized",
       geminiConfigured: !!GEMINI_API_KEY, 
       model: GEMINI_MODEL 
     });
@@ -344,6 +290,7 @@ app.get("/health", async (req, res) => {
     res.json({ 
       status: "Server running", 
       database: "disconnected",
+      firebase: "initialized", 
       geminiConfigured: !!GEMINI_API_KEY, 
       model: GEMINI_MODEL,
       warning: "Database not available, using fallback"
@@ -354,5 +301,5 @@ app.get("/health", async (req, res) => {
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  console.log("Endpoints: POST /signup, POST /login, POST /auth/google, POST /summarize, GET /health, GET /user");
+  console.log("Endpoints: GET /user, POST /init-user, POST /summarize, GET /health");
 });
