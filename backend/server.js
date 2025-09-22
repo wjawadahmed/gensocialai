@@ -1,4 +1,4 @@
-// server.js
+// server.js - FIXED VERSION
 import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
@@ -75,10 +75,10 @@ const createUser = async (userData) => {
       [email, password, googleId, remainingCredits]
     );
     
+    // Return user data WITHOUT the password (FIXED)
     return { 
       id: result.lastID, 
       email, 
-      password, 
       googleId, 
       remainingCredits 
     };
